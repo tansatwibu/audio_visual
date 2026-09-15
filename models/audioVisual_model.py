@@ -25,7 +25,7 @@ class AudioVisualModel(torch.nn.Module):
         audio_mix_mags = input['audio_mix_mags']
         visuals = input['visuals']
         audio_mix_mags = audio_mix_mags + 1e-10
-        pose_feature = input['poses']
+        #pose_feature = input['poses']
 
         #print(audio_mags.mean())
         #print(visuals.mean())
@@ -69,7 +69,7 @@ class AudioVisualModel(torch.nn.Module):
         audio_log_mags = torch.log(audio_mix_mags).detach()
         # print("visual feat size: ", visual_feature.size())
         # print("pose feat size: ", pose_feature.size())
-        mask_prediction = self.net_unet(audio_log_mags,visual_feature, pose_feature)
+        mask_prediction = self.net_unet(audio_log_mags,visual_feature)
         # print('mask_prediction: ', mask_prediction)
         #mask_prediction = self.net_unet(audio_log_mags, visual_feature)
 

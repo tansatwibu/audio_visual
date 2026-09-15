@@ -5,7 +5,7 @@ from options.train_options import TrainOptions
 from data.data_loader import CreateDataLoader
 from models.models import ModelBuilder
 from models.audioVisual_model import AudioVisualModel
-from scipy.misc import imsave
+from imageio.v2 import imwrite as imsave
 import scipy.io.wavfile as wavfile
 import numpy as np
 import torch
@@ -52,7 +52,7 @@ def save_visualization(vis_rows, outputs, batch_data, save_dir, opt):
     visual_object = outputs['visual_object']
     gt_label = outputs['gt_label']
     _, pred_label = torch.max(output['pred_label'], 1)
-    label_list = ['xylophone', 'cello', 'tuba', 'acoustic_guitar', 'erhu', 'clarinet', 'saxophone', 'trumpet', 'flute', 'violin', 'accordion'] #, 'harp', 'drum', 'trumbone', 'piano']['Banjo', 'Cello', 'Drum', 'Guitar', 'Harp', 'Harmonica', 'Oboe', 'Piano', 'Saxophone', \
+    label_list = ['Dan_da', 'Dan_nguyet', 'Dan_tranh', 'Tam_thap_luc', 'dan_bau', 'dan_day', 'dan_nhi', 'dantrung', 'kenbau', 'sao_truc', 'tyba'] #, 'harp', 'drum', 'trumbone', 'piano']['Banjo', 'Cello', 'Drum', 'Guitar', 'Harp', 'Harmonica', 'Oboe', 'Piano', 'Saxophone', \
 
     # unwarp log scale
     B = mag_mix.size(0)

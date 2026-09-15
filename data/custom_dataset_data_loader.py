@@ -6,7 +6,7 @@ from torch.utils.data.distributed import DistributedSampler
 def CreateDataset(opt):
     dataset = None
     if opt.model == 'audioVisualMUSIC':
-        from data.audioVisual_dataset import AudioVisualMUSICDataset
+        from data.ducanh_audioVisual_dataset import AudioVisualMUSICDataset
         dataset = AudioVisualMUSICDataset()
     else:
         raise ValueError("Dataset [%s] not recognized." % opt.model)
