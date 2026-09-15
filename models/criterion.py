@@ -9,10 +9,11 @@ class BaseLoss(nn.Module):
     def forward(self, preds, targets, weight=None):
         if isinstance(preds, list):
             N = len(preds)
-            if weight is None:
-                weight = preds[0].new_ones(1)
-
-            errs = [self._forward(preds[n], targets[n], weight[n])
+            # Each entry needs its own weight. A single size-1 tensor indexed by
+            # n raises IndexError as soon as N > 1; a size-1 tensor per entry
+            # broadcasts to the full sample inside _forward.
+            errs = [self._forward(preds[n], targets[n],
+                                  preds[n].new_ones(1) if weight is None else weight[n])
                     for n in range(N)]
             err = torch.mean(torch.stack(errs))
 
