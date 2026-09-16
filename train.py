@@ -110,15 +110,17 @@ def save_checkpoint(net_visual, net_unet, optimizer, total_batches, best_err, op
     utils.mkdirs(ckpt_dir)
     torch.save(net_visual.state_dict(), os.path.join(ckpt_dir, 'visual_%s.pth' % tag))
     torch.save(net_unet.state_dict(), os.path.join(ckpt_dir, 'unet_%s.pth' % tag))
-    if tag == 'latest':
-        # Kept next to the weight-only files because --continue_train needs the
-        # optimizer state and the lr_steps / best-error bookkeeping to resume.
-        torch.save({'net_visual': net_visual.state_dict(),
-                    'net_unet': net_unet.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'total_batches': total_batches,
-                    'best_err': best_err},
-                   os.path.join(ckpt_dir, 'training_state.pth'))
+    # Written for every tag, not just 'latest': the best model is saved after
+    # the latest one, so a sidecar refreshed only on 'latest' would still hold
+    # the pre-validation best_err and a resumed run would then overwrite
+    # unet_best.pth with a worse model. Holds the optimizer state and the
+    # lr_steps / best-error bookkeeping --continue_train needs.
+    torch.save({'net_visual': net_visual.state_dict(),
+                'net_unet': net_unet.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'total_batches': total_batches,
+                'best_err': best_err},
+               os.path.join(ckpt_dir, 'training_state.pth'))
 
 #decreae learning rate
 def decrease_learning_rate(optimizer, decay_factor=0.1):
@@ -237,18 +239,16 @@ def display_val(model, crit, writer, index, dataset_val_loader, opt):
 
         with torch.no_grad():
             for i, val_data in enumerate(dataset_val_loader):
-                if i < opt.validation_batches:
-                    output = model(val_data)
-                    coseparation_loss = get_coseparation_loss(output, opt, crit['loss_coseparation']) * opt.coseparation_loss_weight
-                    coseparation_losses.append(coseparation_loss.item())
-                else:
+                if i >= opt.validation_batches:
                     # The val loader is built with one batch beyond
                     # validation_batches, so this branch is reachable exactly
                     # when --validation_visualization is set.
                     if opt.validation_visualization:
-                        output = model(val_data)
-                        save_visualization(vis_rows, output, val_data, save_dir, opt)
+                        save_visualization(vis_rows, model(val_data), val_data, save_dir, opt)
                     break
+                output = model(val_data)
+                coseparation_loss = get_coseparation_loss(output, opt, crit['loss_coseparation']) * opt.coseparation_loss_weight
+                coseparation_losses.append(coseparation_loss.item())
 
         avg_coseparation_loss = sum(coseparation_losses)/len(coseparation_losses)
         if vis_rows:
@@ -300,112 +300,6 @@ def get_coseparation_loss(output, opt, loss_coseparation):
         coseparation_loss = loss_coseparation(predicted_mask_list, gt_mask_list, weight_list)
         return coseparation_loss
 
-# def get_crossmodal_loss1(output, opt, loss_triplet):
-#     visual_feature = output['visual_embadding']
-#     audio_embaddings = output['audio_embeddings_gt']
-#     audio_embaddings_pred = output[' audio_embeddings_pred']
-
-#     if random.random() > 0.5:
-#         audio_embaddings = audio_embaddings_pred
-#     else:
-#         audio_embaddings = audio_embaddings
-
-
-#     #crossmodal_loss = loss_triplet(audio_embeddings_A1, identity_feature_A, identity_feature_B) + loss_triplet(audio_embeddings_A2, identity_feature_A, identity_feature_B) + loss_triplet(audio_embeddings_B1, identity_feature_B, identity_feature_A) + loss_triplet(audio_embeddings_B2, identity_feature_B, identity_feature_A)
-#     crossmodal_loss = 0
-#     for i in range(1):
-#         if i == 1 : 
-#             crossmodal_loss = crossmodal_loss + loss_triplet(audio_embaddings[i], visual_feature[i], visual_feature[0]) + loss_triplet(audio_embaddings[0], visual_feature[0], visual_feature[i])
-#         crossmodal_loss = crossmodal_loss + loss_triplet(audio_embaddings[i], visual_feature[i], visual_feature[i+1]) + loss_triplet(audio_embaddings[i+1], visual_feature[i+1], visual_feature[i])
-#     return crossmodal_loss
-
-# #https://arxiv.org/pdf/2101.03149.pdf
-# #https://github.com/facebookresearch/VisualVoice
-# def get_crossmodal_loss(output, opt, loss_triplet):
-#     visual_feature = output['visual_embadding']
-#     audio_embaddings = output['audio_embeddings_gt']
-#     audio_embaddings_pred = output['audio_embeddings_pred']
-
-#     #audio_embaddings_pred = F.normalize(audio_embaddings_pred, p=2, dim=1)
-#     #audio_embaddings = F.normalize(audio_embaddings, p=2, dim=1)
-#     #visual_feature = F.normalize(visual_feature, p=2, dim=1)
-#     vids = output['vids']
-#     count = 0.0
-#     #print(vids)
-
-#     if random.random() > 0.5:
-#         #print("1")
-#         audio_embaddings = audio_embaddings_pred
-#     else:
-#         audio_embaddings = audio_embaddings
-#        #print("0")
-
-#     #gt_labels = output['gt_labels']
-#     #print(audio_embaddings.shape)
-#     #print(visual_feature.shape)
-
-#     for i in range(visual_feature.shape[0]):
-#         if np.count_nonzero(vids.cpu().detach().numpy() == vids[i].cpu().detach().numpy()) > 1:
-#             #print("Trung o i :")
-#             #print(vids[i])
-#             continue
-#         for j in range(visual_feature.shape[0]):
-#             if np.count_nonzero(vids.cpu().detach().numpy() == vids[j].cpu().detach().numpy()) > 1:
-#                 #print("Trung o j :")
-#                 #print(vids[j])
-#                 continue
-#             if (audio_embaddings[i].cpu().detach().numpy() != audio_embaddings[j].cpu().detach().numpy()).any():
-#                 #print("Duoc xet: ")
-#                 #print(vids[i])
-#                 #print(vids[j])
-#                 #print("------------")
-#                 #crossmodal_loss = crossmodal_loss + loss_triplet(audio_embaddings[i], visual_feature[i], visual_feature[j]) + loss_triplet(audio_embaddings[j], visual_feature[j], visual_feature[i])
-#                 if count == 0.0 :
-#                     crossmodal_loss = loss_triplet(audio_embaddings[i], visual_feature[i], visual_feature[j])
-#                     count = count + 1.0
-#                 else :
-#                     crossmodal_loss = crossmodal_loss + loss_triplet(audio_embaddings[i], visual_feature[i], visual_feature[j])
-#                     count = count + 1.0
-#                 #print(count)
-#                 #print(loss_triplet(audio_embaddings[i], visual_feature[i], visual_feature[j]))
-#                 #print("--------------------------------")
-                
-#                 #print("---------------------")
-#                 #print("Audio embaddings: ")
-#                 #print(audio_embaddings[i].shape)
-#                 #print("Visual feature:")
-#                 #print(visual_feature[i].shape)
-#                 #print(visual_feature[j].shape)
-#                 #print("----------------------")
-#     if count == 0.0:
-#         print("All duet")
-#         for i in range(visual_feature.shape[0]):
-#             for j in range(visual_feature.shape[0]):
-#                 if (audio_embaddings[i].cpu().detach().numpy() != audio_embaddings[j].cpu().detach().numpy()).any():
-#                     if count == 0.0 :
-#                         crossmodal_loss = loss_triplet(audio_embaddings[i], visual_feature[i], visual_feature[j])
-#                         count = count + 1.0
-#                     else :
-#                         crossmodal_loss = crossmodal_loss + loss_triplet(audio_embaddings[i], visual_feature[i], visual_feature[j])
-#                         count = count + 1.0
-#         try:
-#             crossmodal_loss = crossmodal_loss / (count) * 2.0
-#         except:
-#             for i in range(visual_feature.shape[0]):
-#                 for j in range(visual_feature.shape[0]):
-#                     if count == 0.0 :
-#                         crossmodal_loss = loss_triplet(audio_embaddings[i], visual_feature[i], visual_feature[j])
-#                         count = count + 1.0
-#                     else :
-#                         crossmodal_loss = crossmodal_loss + loss_triplet(audio_embaddings[i], visual_feature[i], visual_feature[j])
-#                         count = count + 1.0
-#             crossmodal_loss = crossmodal_loss / (count) * 2.0
-        
-#     else:
-#         crossmodal_loss = crossmodal_loss / (count) * 2.0
-#     #print(type(crossmodal_loss))
-#     return crossmodal_loss
-
 
 #parse arguments (extra flags are registered before parsing)
 options = TrainOptions()
@@ -429,16 +323,19 @@ if opt.auto_split:
               % (split_dir, n_videos, n_val, counts))
 opt.hdf5_path = split_dir
 
-# The dataset reads <mode>.txt from hdf5_path, so fail early with a useful
-# message instead of a bare FileNotFoundError deep inside initialize().
-needed = [opt.mode + '.txt'] + (['val.txt'] if opt.validation_on else [])
-for name in needed:
-    path = os.path.join(opt.hdf5_path, name)
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            '%s not found. Either pass --auto_split to build the split lists from '
-            '--data_path, or point --split_dir at a directory holding %s.'
-            % (path, ' and '.join(needed)))
+# The dataset reads <mode>.txt from hdf5_path when a split file is prebuilt,
+# so fail early with a useful message instead of a bare FileNotFoundError deep
+# inside initialize(). --auto_split always writes both files, so this only
+# guards the case where an existing split dir is reused.
+if not opt.auto_split:
+    needed = [opt.mode + '.txt'] + (['val.txt'] if opt.validation_on else [])
+    for name in needed:
+        path = os.path.join(opt.hdf5_path, name)
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                '%s not found. Either pass --auto_split to build the split lists '
+                'from --data_path, or point --split_dir at a directory holding %s.'
+                % (path, ' and '.join(needed)))
 
 #construct data loader
 dataset, dataset_loader = create_loader(opt, num_workers=int(opt.nThreads))
