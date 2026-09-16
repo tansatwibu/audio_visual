@@ -1,33 +1,124 @@
 
+import copy
+import glob
 import os
 import time
+
+import numpy as np
+import scipy.io.wavfile as wavfile
+import torch
+import torch.nn.functional as F
+from imageio.v2 import imwrite as imsave
+
 from options.train_options import TrainOptions
-from data.data_loader import CreateDataLoader
 from models.models import ModelBuilder
 from models.audioVisual_model import AudioVisualModel
-from imageio.v2 import imwrite as imsave
-import scipy.io.wavfile as wavfile
-import numpy as np
-import torch
-from torch.autograd import Variable
-import librosa
-from utils import utils,viz
 from models import criterion
-import torch.nn.functional as F
-import random
+from utils import utils, viz
+from utils.utils import object_collate
 
-#create optimizer
+
+def load_dataset(opt):
+    """Build the only dataset this entry point supports.
+
+    One --data_path must hold frame/, reshape_11025/ and yolo_top_detections/.
+    'audioVisual' is the name script.sh uses and 'audioVisualMUSIC' is the
+    dataset class name; both select the same two-branch loader.
+    """
+    if opt.model not in ('audioVisual', 'audioVisualMUSIC'):
+        raise ValueError("--model must be 'audioVisual' for the two-branch "
+                         "audio+visual setup, got %r" % opt.model)
+    from data.ducanh_audioVisual_dataset import AudioVisualMUSICDataset
+    dataset = AudioVisualMUSICDataset()
+    dataset.initialize(opt)
+    print('dataset [%s] was created' % dataset.name())
+    return dataset
+
+
+def build_split_lists(data_path, split_dir, val_ratio=0.1, seed=0):
+    """Derive train.txt / val.txt from the detection files on disk.
+
+    Clips are grouped by video so two clips of the same performance never land
+    on opposite sides of the split, which would leak the validation set. The
+    grouping reuses the dataset's own get_vid_name so the split and the loader
+    always agree on what a video is.
+    """
+    pattern = os.path.join(data_path, 'yolo_top_detections', '**', '*.npy')
+    npy_paths = sorted(glob.glob(pattern, recursive=True))
+    if not npy_paths:
+        raise FileNotFoundError('No detections matched %s' % pattern)
+
+    from data.ducanh_audioVisual_dataset import get_vid_name
+    by_video = {}
+    for path in npy_paths:
+        by_video.setdefault(get_vid_name(path), []).append(path)
+
+    if len(by_video) < 2:
+        raise ValueError('--auto_split needs at least 2 videos to hold one out, found %d'
+                         % len(by_video))
+
+    rng = np.random.RandomState(seed)
+    videos = sorted(by_video)
+    rng.shuffle(videos)
+
+    n_val = max(1, min(len(videos) - 1, int(round(len(videos) * val_ratio))))
+    val_videos = set(videos[:n_val])
+
+    utils.mkdirs(split_dir)
+    counts = {}
+    for name, is_val in (('train.txt', False), ('val.txt', True)):
+        paths = sorted(p for v in videos if (v in val_videos) is is_val
+                       for p in by_video[v])
+        with open(os.path.join(split_dir, name), 'w') as f:
+            f.write('\n'.join(paths) + '\n')
+        counts[name] = len(paths)
+
+    return counts, len(videos), n_val
+
+
+def create_loader(opt, num_workers):
+    dataset = load_dataset(opt)
+    loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=opt.batchSize,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=object_collate)
+    return dataset, loader
+
+
 def create_optimizer(nets, opt):
-        (net_visual, net_unet, net_classifier, net_vocal, net_facial_attribtes) = nets
-        param_groups = [{'params': net_visual.parameters(), 'lr': opt.lr_visual},
-                        {'params': net_unet.parameters(), 'lr': opt.lr_unet},
-                        {'params': net_classifier.parameters(), 'lr': opt.lr_classifier},
-                        {'params': net_vocal.parameters(), 'lr': opt.lr_vocal_attributes},
-                        {'params': net_facial_attribtes.parameters(), 'lr': opt.lr_facial_attributes}]
-        if opt.optimizer == 'sgd':
-            return torch.optim.SGD(param_groups, momentum=opt.beta1, weight_decay=opt.weight_decay)
-        elif opt.optimizer == 'adam':
-            return torch.optim.Adam(param_groups, betas=(opt.beta1,0.999), weight_decay=opt.weight_decay)
+    net_visual, net_unet = nets
+    param_groups = [{'params': net_unet.parameters(), 'lr': opt.lr_unet}]
+    if not opt.freeze_visual:
+        param_groups.insert(0, {'params': net_visual.parameters(), 'lr': opt.lr_visual})
+    if opt.optimizer == 'sgd':
+        return torch.optim.SGD(param_groups, momentum=opt.beta1, weight_decay=opt.weight_decay)
+    elif opt.optimizer == 'adam':
+        return torch.optim.Adam(param_groups, betas=(opt.beta1, 0.999), weight_decay=opt.weight_decay)
+    raise ValueError('Unknown --optimizer %r' % opt.optimizer)
+
+
+def cuda_synchronize():
+    # torch.cuda.synchronize() initialises CUDA, which fails on a CPU-only run.
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def save_checkpoint(net_visual, net_unet, optimizer, total_batches, best_err, opt, tag):
+    ckpt_dir = os.path.join(opt.checkpoints_dir, opt.name)
+    utils.mkdirs(ckpt_dir)
+    torch.save(net_visual.state_dict(), os.path.join(ckpt_dir, 'visual_%s.pth' % tag))
+    torch.save(net_unet.state_dict(), os.path.join(ckpt_dir, 'unet_%s.pth' % tag))
+    if tag == 'latest':
+        # Kept next to the weight-only files because --continue_train needs the
+        # optimizer state and the lr_steps / best-error bookkeeping to resume.
+        torch.save({'net_visual': net_visual.state_dict(),
+                    'net_unet': net_unet.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'total_batches': total_batches,
+                    'best_err': best_err},
+                   os.path.join(ckpt_dir, 'training_state.pth'))
 
 #decreae learning rate
 def decrease_learning_rate(optimizer, decay_factor=0.1):
@@ -43,16 +134,11 @@ def save_visualization(vis_rows, outputs, batch_data, save_dir, opt):
     # fetch data and predictions
     mag_mix = batch_data['audio_mix_mags']
     phase_mix = batch_data['audio_mix_phases']
-    visuals = batch_data['visuals']
 
     pred_masks_ = outputs['pred_mask']
     gt_masks_ = outputs['gt_mask']
     mag_mix_ = outputs['audio_mix_mags']
     weight_ = outputs['weight']
-    visual_object = outputs['visual_object']
-    gt_label = outputs['gt_label']
-    _, pred_label = torch.max(output['pred_label'], 1)
-    label_list = ['Dan_da', 'Dan_nguyet', 'Dan_tranh', 'Tam_thap_luc', 'dan_bau', 'dan_day', 'dan_nhi', 'dantrung', 'kenbau', 'sao_truc', 'tyba'] #, 'harp', 'drum', 'trumbone', 'piano']['Banjo', 'Cello', 'Drum', 'Guitar', 'Harp', 'Harmonica', 'Oboe', 'Piano', 'Saxophone', \
 
     # unwarp log scale
     B = mag_mix.size(0)
@@ -65,43 +151,37 @@ def save_visualization(vis_rows, outputs, batch_data, save_dir, opt):
         gt_masks_linear = gt_masks_
 
     # convert into numpy
-    mag_mix = mag_mix.numpy()
+    mag_mix = mag_mix.detach().cpu().numpy()
     mag_mix_ = mag_mix_.detach().cpu().numpy()
-    phase_mix = phase_mix.numpy()
-    weight_ = weight_.detach().cpu().numpy()
+    phase_mix = phase_mix.detach().cpu().numpy()
     pred_masks_ = pred_masks_.detach().cpu().numpy()
     pred_masks_linear = pred_masks_linear.detach().cpu().numpy()
     gt_masks_ = gt_masks_.detach().cpu().numpy()
     gt_masks_linear = gt_masks_linear.detach().cpu().numpy()
-    visual_object = visual_object.detach().cpu().numpy()
-    gt_label = gt_label.detach().cpu().numpy()
-    pred_label = pred_label.detach().cpu().numpy()
+    weight_ = None if weight_ is None else weight_.detach().cpu().numpy()
 
     # loop over each example
     for j in range(min(B, opt.num_visualization_examples)):
         row_elements = []
 
-        # video names
-        prefix = str(j) + '-' + label_list[int(gt_label[j])] + '-' + label_list[int(pred_label[j])]
+        # one folder per example
+        prefix = 'example-%d' % j
         utils.mkdirs(os.path.join(save_dir, prefix))
 
         # save mixture
-        mix_wav = utils.istft_coseparation(mag_mix[j, 0], phase_mix[j, 0], hop_length=opt.stft_hop)
+        mix_wav = utils.istft_reconstruction(mag_mix[j, 0], phase_mix[j, 0], hop_length=opt.stft_hop)
         mix_amp = utils.magnitude2heatmap(mag_mix_[j, 0])
-        weight = utils.magnitude2heatmap(weight_[j, 0], log=False, scale=100.)
         filename_mixwav = os.path.join(prefix, 'mix.wav')
         filename_mixmag = os.path.join(prefix, 'mix.jpg')
-        filename_weight = os.path.join(prefix, 'weight.jpg')
         imsave(os.path.join(save_dir, filename_mixmag), mix_amp[::-1, :, :])
-        imsave(os.path.join(save_dir, filename_weight), weight[::-1, :])
         wavfile.write(os.path.join(save_dir, filename_mixwav), opt.audio_sampling_rate, mix_wav)
         row_elements += [{'text': prefix}, {'image': filename_mixmag, 'audio': filename_mixwav}]
 
         # GT and predicted audio reconstruction
         gt_mag = mag_mix[j, 0] * gt_masks_linear[j, 0]
-        gt_wav = utils.istft_coseparation(gt_mag, phase_mix[j, 0], hop_length=opt.stft_hop)
+        gt_wav = utils.istft_reconstruction(gt_mag, phase_mix[j, 0], hop_length=opt.stft_hop)
         pred_mag = mag_mix[j, 0] * pred_masks_linear[j, 0]
-        preds_wav = utils.istft_coseparation(pred_mag, phase_mix[j, 0], hop_length=opt.stft_hop)
+        preds_wav = utils.istft_reconstruction(pred_mag, phase_mix[j, 0], hop_length=opt.stft_hop)
 
         # output masks
         filename_gtmask = os.path.join(prefix, 'gtmask.jpg')
@@ -131,64 +211,55 @@ def save_visualization(vis_rows, outputs, batch_data, save_dir, opt):
                 {'image': filename_predmask},
                 {'image': filename_gtmask}]
 
-        row_elements += [{'image': filename_weight}]
+        if weight_ is not None:
+            filename_weight = os.path.join(prefix, 'weight.jpg')
+            weight = utils.magnitude2heatmap(weight_[j, 0], log=False, scale=100.)
+            imsave(os.path.join(save_dir, filename_weight), weight[::-1, :])
+            row_elements += [{'image': filename_weight}]
+
         vis_rows.append(row_elements)
 
 #used to display validation loss
-def display_val(model, crit, writer, index, dataset_val, opt):
+def display_val(model, crit, writer, index, dataset_val_loader, opt):
         # remove previous viz results
         save_dir = os.path.join('.', opt.checkpoints_dir, opt.name, 'visualization')
         utils.mkdirs(save_dir)
 
         #initial results lists
-        accuracies = []
-        classifier_losses = []
         coseparation_losses = []
-        # crossmodal_losses = []
 
         # initialize HTML header
         visualizer = viz.HTMLVisualizer(os.path.join(save_dir, 'index.html'))
-        header = ['Filename', 'Input Mixed Audio']
-        header += ['Predicted Audio' 'GroundTruth Audio', 'Predicted Mask','GroundTruth Mask', 'Loss weighting']
-        visualizer.add_header(header)
+        visualizer.add_header(['Filename', 'Input Mixed Audio', 'Predicted Audio',
+                               'GroundTruth Audio', 'Predicted Mask', 'GroundTruth Mask',
+                               'Loss weighting'])
         vis_rows = []
 
         with torch.no_grad():
-            for i, val_data in enumerate(dataset_val):
+            for i, val_data in enumerate(dataset_val_loader):
                 if i < opt.validation_batches:
-                    output = model.forward(val_data)
-                    loss_classification = crit['loss_classification']
-                    classifier_loss = loss_classification(output['pred_label'], Variable(output['gt_label'], requires_grad=False)) * opt.classifier_loss_weight
+                    output = model(val_data)
                     coseparation_loss = get_coseparation_loss(output, opt, crit['loss_coseparation']) * opt.coseparation_loss_weight
-                    # crossmodal_loss = get_crossmodal_loss(output, opt, crit['loss_triplet']) * opt.crossmodal_loss_weight
-                    classifier_losses.append(classifier_loss.item()) 
                     coseparation_losses.append(coseparation_loss.item())
-                    # crossmodal_losses.append(crossmodal_loss.item())
-
-                    gt_label = output['gt_label']
-                    _, pred_label = torch.max(output['pred_label'], 1)
-                    accuracy = torch.sum(gt_label == pred_label).item() * 1.0 / pred_label.shape[0]
-                    accuracies.append(accuracy)
                 else:
+                    # The val loader is built with one batch beyond
+                    # validation_batches, so this branch is reachable exactly
+                    # when --validation_visualization is set.
                     if opt.validation_visualization:
-                        output = model.forward(val_data)
-                        save_visualization(vis_rows, output, val_data, save_dir, opt) #visualize one batch
+                        output = model(val_data)
+                        save_visualization(vis_rows, output, val_data, save_dir, opt)
                     break
 
-        avg_accuracy = sum(accuracies)/len(accuracies)
-        avg_classifier_loss = sum(classifier_losses)/len(classifier_losses)
         avg_coseparation_loss = sum(coseparation_losses)/len(coseparation_losses)
-        # avg_crossmodal_loss = sum(crossmodal_losses)/len(crossmodal_losses)
+        if vis_rows:
+            visualizer.add_rows(vis_rows)
+            visualizer.write_html()
+        # The co-separation loss is the only validation signal left; the old
+        # accuracy and classifier numbers were dropped with the classifier.
         if opt.tensorboard:
-            writer.add_scalar('data/val_classifier_loss', avg_classifier_loss, index)
-            writer.add_scalar('data/val_accuracy', avg_accuracy, index)
             writer.add_scalar('data/val_coseparation_loss', avg_coseparation_loss, index)
-            # writer.add_scalar('data/val_crossmodal_loss', avg_crossmodal_loss, index)
-        print('val accuracy: %.3f' % avg_accuracy)
-        print('val classifier loss: %.3f' % avg_classifier_loss)
-        print('val coseparation loss: %.3f' % avg_coseparation_loss)
-        # print('val crossmodal loss: %.5f' % avg_crossmodal_loss)
-        return avg_coseparation_loss + avg_classifier_loss
+        print('val coseparation loss: %.4f' % avg_coseparation_loss)
+        return avg_coseparation_loss
 
 def get_coseparation_loss(output, opt, loss_coseparation):
         #initialize a dic to store the index of the list
@@ -204,21 +275,20 @@ def get_coseparation_loss(output, opt, loss_coseparation):
         #initialize three lists of length = number of video clips to reconstruct
         predicted_mask_list = [None for i in range(len(vid_index_dic.keys()))]
         gt_mask_list = [None for i in range(len(vid_index_dic.keys()))]
-        weight_list = [None for i in range(len(vid_index_dic.keys()))]
+        weight_list = [None for i in range(len(vid_index_dic.keys()))] if opt.weighted_loss else None
 
         #iterate through all objects
         gt_masks = output['gt_mask']
         mask_prediction = output['pred_mask']
+        # None unless --weighted_loss; weight_list stays None in that case so
+        # BaseLoss falls back to uniform weights instead of a list of Nones.
         weight = output['weight']
 
-        # print(gt_masks)
-        # print(mask_prediction)
-        # print(weight)
         for i in range(O):
             if predicted_mask_list[vid_index_dic[vids[i]]] is None:
                 gt_mask_list[vid_index_dic[vids[i]]] = gt_masks[i,:,:,:]
-                weight_list[vid_index_dic[vids[i]]] = weight[i,:,:,:]
-                # weight_list[vid_index_dic[vids[i]]] = gt_masks[i,:,:,:]
+                if weight_list is not None:
+                    weight_list[vid_index_dic[vids[i]]] = weight[i,:,:,:]
                 predicted_mask_list[vid_index_dic[vids[i]]] = mask_prediction[i,:,:,:]
             else:
                 predicted_mask_list[vid_index_dic[vids[i]]] = predicted_mask_list[vid_index_dic[vids[i]]] + mask_prediction[i,:,:,:]
@@ -227,10 +297,7 @@ def get_coseparation_loss(output, opt, loss_coseparation):
             for i in range(O):
                 #clip the prediction results to make it in the range of [0,1] for BCE loss
                 predicted_mask_list[vid_index_dic[vids[i]]] = torch.clamp(predicted_mask_list[vid_index_dic[vids[i]]], 0, 1)
-        # print("len predict mask",len(predicted_mask_list))
-        # print("len gt mask",len(gt_mask_list))
         coseparation_loss = loss_coseparation(predicted_mask_list, gt_mask_list, weight_list)
-        #print(type(coseparation_loss))
         return coseparation_loss
 
 # def get_crossmodal_loss1(output, opt, loss_triplet):
@@ -340,28 +407,54 @@ def get_coseparation_loss(output, opt, loss_coseparation):
 #     return crossmodal_loss
 
 
-#parse arguments
-opt = TrainOptions().parse()
-opt.device = torch.device("cuda")
+#parse arguments (extra flags are registered before parsing)
+options = TrainOptions()
+options.initialize()
+options.parser.add_argument('--freeze_visual', action='store_true',
+                            help='freeze the visual stream and optimise only the UNet')
+options.parser.add_argument('--auto_split', action='store_true',
+                            help='regenerate train.txt/val.txt from --data_path before training')
+options.parser.add_argument('--split_dir', type=str, default='',
+                            help='where the generated split lists go (default: checkpoints_dir/name/splits)')
+options.parser.add_argument('--val_ratio', type=float, default=0.1,
+                            help='fraction of videos held out when --auto_split')
+opt = options.parse()
+opt.device = torch.device('cuda:%d' % opt.gpu_ids[0]) if opt.gpu_ids else torch.device('cpu')
 
-if opt.with_additional_scene_image:
-    opt.number_of_classes = opt.number_of_classes + 1
+#build split lists if needed, then point the dataset at them
+split_dir = opt.split_dir or os.path.join(opt.checkpoints_dir, opt.name, 'splits')
+if opt.auto_split:
+        counts, n_videos, n_val = build_split_lists(opt.data_path, split_dir, opt.val_ratio, opt.seed)
+        print('generated splits in %s: %d videos (%d held out) | %s'
+              % (split_dir, n_videos, n_val, counts))
+opt.hdf5_path = split_dir
+
+# The dataset reads <mode>.txt from hdf5_path, so fail early with a useful
+# message instead of a bare FileNotFoundError deep inside initialize().
+needed = [opt.mode + '.txt'] + (['val.txt'] if opt.validation_on else [])
+for name in needed:
+    path = os.path.join(opt.hdf5_path, name)
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            '%s not found. Either pass --auto_split to build the split lists from '
+            '--data_path, or point --split_dir at a directory holding %s.'
+            % (path, ' and '.join(needed)))
 
 #construct data loader
-data_loader = CreateDataLoader(opt)
-dataset = data_loader.load_data()
-dataset_size = len(data_loader)
-print('#training images = %d' % dataset_size)
+dataset, dataset_loader = create_loader(opt, num_workers=int(opt.nThreads))
+print('#training samples = %d' % len(dataset))
 
-#create validation set data loader if validation_on option is set
+#create validation set data loader if validation_on option is set.
+# A shallow copy keeps the val dataset from writing its mode back into the
+# training namespace, which would switch augmentation off inside the workers.
 if opt.validation_on:
-        #temperally set to val to load val data
-        opt.mode = 'val'
-        data_loader_val = CreateDataLoader(opt)
-        dataset_val = data_loader_val.load_data()
-        dataset_size_val = len(data_loader_val)
-        print('#validation images = %d' % dataset_size_val)
-        opt.mode = 'train' #set it back
+        opt_val = copy.copy(opt)
+        opt_val.mode = 'val'
+        if opt.validation_visualization:
+                # one extra batch beyond validation_batches feeds save_visualization
+                opt_val.validation_batches = opt.validation_batches + 1
+        dataset_val, dataset_val_loader = create_loader(opt_val, num_workers=2)
+        print('#validation samples = %d' % len(dataset_val))
 
 if opt.tensorboard:
     from tensorboardX import SummaryWriter
@@ -369,157 +462,113 @@ if opt.tensorboard:
 else:
     writer = None
 
-# Network Builders
+# Network Builders: only the two branches survive
 builder = ModelBuilder()
-#if identity feature dim is not 512, for resnet reduce dimension to this feature dim
-'''
-if opt.identity_feature_dim = 512:
-    opt.with_fc = True
-else:
-    opt.with_fc = False
-'''
 net_visual = builder.build_visual(
         pool_type=opt.visual_pool,
         fc_out = 256,
-        weights=opt.weights_visual)  
+        weights=opt.weights_visual)
 net_unet = builder.build_unet(
         unet_num_layers = opt.unet_num_layers,
         ngf=opt.unet_ngf,
         input_nc=opt.unet_input_nc,
         output_nc=opt.unet_output_nc,
         weights=opt.weights_unet)
-net_classifier = builder.build_classifier(
-        pool_type=opt.classifier_pool,
-        num_of_classes=opt.number_of_classes,
-        input_channel=opt.unet_output_nc,
-        weights=opt.weights_classifier)
-net_vocal = builder.build_vocal(
-        pool_type=opt.audio_pool,
-        input_channel=1,
-        with_fc= True,
-        fc_out = opt.identity_feature_dim,
-        weights=opt.weights_vocal)
-net_facial_attribtes = builder.build_facial(
-        pool_type=opt.visual_pool,
-        fc_out = opt.identity_feature_dim,
-        with_fc=True,
-        weights=opt.weights_facial)
-nets = (net_visual, net_unet, net_classifier, net_vocal, net_facial_attribtes)
- 
+if opt.freeze_visual:
+        utils.set_requires_grad([net_visual], False)
+# The two branches, in the order AudioVisualModel unpacks them.
+nets = (net_visual, net_unet)
+
 # construct our audio-visual model
 model = AudioVisualModel(nets, opt)
-model = torch.nn.DataParallel(model, device_ids=opt.gpu_ids )
-#model = torch.nn.DataParallel(model, device_ids=opt.gpu_ids)
 model.to(opt.device)
 
 # Set up optimizer
 optimizer = create_optimizer(nets, opt)
 
 # Set up loss functions
-if opt.triplet_loss_type == 'tripletCosine':
-    loss_triplet = criterion.TripletLossCosine(opt.margin)
-elif opt.triplet_loss_type == 'triplet':
-    loss_triplet = criterion.TripletLoss(opt.margin)
-loss_classification = criterion.CELoss()
 if opt.mask_loss_type == 'L1':
     loss_coseparation = criterion.L1Loss()
 elif opt.mask_loss_type == 'L2':
     loss_coseparation = criterion.L2Loss()
 elif opt.mask_loss_type == 'BCE':
     loss_coseparation = criterion.BCELoss()
+else:
+    raise ValueError('Unknown --mask_loss_type %r' % opt.mask_loss_type)
 if(len(opt.gpu_ids) > 0):
-    loss_triplet.cuda(opt.gpu_ids[0])
-    loss_classification.cuda(opt.gpu_ids[0])
     loss_coseparation.cuda(opt.gpu_ids[0])
 
-
-crit = {'loss_classification': loss_classification, 'loss_coseparation': loss_coseparation, 'loss_triplet': loss_triplet}
-
-
+crit = {'loss_coseparation': loss_coseparation}
 #initialization
 total_batches = 0
 data_loading_time = []
 model_forward_time = []
 model_backward_time = []
-batch_classifier_loss = []
 batch_coseparation_loss = []
-# batch_crossmodal_loss = []
 best_err = float("inf")
 
+# Resume before the first batch so the restored counters and lr schedule are in
+# force for the whole run.
+if opt.continue_train:
+    state_path = os.path.join('.', opt.checkpoints_dir, opt.name, 'training_state.pth')
+    if not os.path.exists(state_path):
+        raise FileNotFoundError(
+            '--continue_train needs %s; run at least one --save_latest_freq '
+            'interval first.' % state_path)
+    state = torch.load(state_path, map_location=opt.device)
+    net_visual.load_state_dict(state['net_visual'])
+    net_unet.load_state_dict(state['net_unet'])
+    optimizer.load_state_dict(state['optimizer'])
+    total_batches = state['total_batches']
+    best_err = state['best_err']
+    print('resumed from %s at total_batches %d (best_err %.5f)'
+          % (state_path, total_batches, best_err))
+
 for epoch in range(1 + opt.epoch_count, opt.niter+1):
-        torch.cuda.synchronize()
+        cuda_synchronize()
         epoch_start_time = time.time()
 
         if(opt.measure_time):
                 iter_start_time = time.time()
-        for i, data in enumerate(dataset):
-                # print("data: ", data.__class__)
+        for i, data in enumerate(dataset_loader):
+                # `data` is the collated dict from object_collate; iterating the
+                # raw Dataset would yield per-sample numpy instead of tensors.
                 if(opt.measure_time):
-                    torch.cuda.synchronize()
+                    cuda_synchronize()
                     iter_data_loaded_time = time.time()
-
-                #print(data['label'].size())
-                total_batches += 1
 
                 #forward pass
                 model.zero_grad()
-                #print("0")
-                output = model.forward(data)
-                # print('data: ', data)
-                # print('output: ', output)
-                #print("1")
+                output = model(data)
 
-                #compute loss
-                #classifier_loss
-                classifier_loss = loss_classification(output['pred_label'], Variable(output['gt_label'], requires_grad=False)) * opt.classifier_loss_weight
-
-                #coseparation loss
+                # The co-separation mask loss is the only objective left
                 coseparation_loss = get_coseparation_loss(output, opt, loss_coseparation) * opt.coseparation_loss_weight
 
-                #crossmodal loss
-                # crossmodal_loss = get_crossmodal_loss(output, opt, loss_triplet) * opt.crossmodal_loss_weight
-
                 if(opt.measure_time):
-                    torch.cuda.synchronize()
+                    cuda_synchronize()
                     iter_data_forwarded_time = time.time()
-                #store losses for this batch
-                batch_classifier_loss.append(classifier_loss.item())
                 batch_coseparation_loss.append(coseparation_loss.item())
-                # batch_crossmodal_loss.append(crossmodal_loss.item())
 
                 optimizer.zero_grad()
-                classifier_loss.backward(retain_graph=True)
-                
-                coseparation_loss.backward(retain_graph=True)
-                # crossmodal_loss.backward()
+                coseparation_loss.backward()
                 optimizer.step()
 
                 if(opt.measure_time):
-                    torch.cuda.synchronize()
-                    iter_model_backwarded_time = time.time()
-
-                if(opt.measure_time):
-                        torch.cuda.synchronize()
+                        cuda_synchronize()
                         iter_model_backwarded_time = time.time()
                         data_loading_time.append(iter_data_loaded_time - iter_start_time)
                         model_forward_time.append(iter_data_forwarded_time - iter_data_loaded_time)
                         model_backward_time.append(iter_model_backwarded_time - iter_data_forwarded_time)
 
+                total_batches += 1
+
                 if(total_batches % opt.display_freq == 0):
                         print('Display training progress at (epoch %d, total_batches %d)' % (epoch, total_batches))
-                        avg_classifier_loss = sum(batch_classifier_loss)/len(batch_classifier_loss)
                         avg_coseparation_loss = sum(batch_coseparation_loss)/len(batch_coseparation_loss)
-                        # avg_crossmodal_loss = sum(batch_crossmodal_loss)/len(batch_crossmodal_loss)
-
-                        # print('classifier loss: %.3f, co-separation loss: %.3f, cross_modal loss: %.3f' \
-                        #     % (avg_classifier_loss, avg_coseparation_loss, avg_crossmodal_loss))
-                        batch_classifier_loss = []
+                        print('co-separation loss: %.5f' % avg_coseparation_loss)
                         batch_coseparation_loss = []
-                        # batch_crossmodal_loss = []
                         if opt.tensorboard:
-                            writer.add_scalar('data/classifier_loss', avg_classifier_loss, i)
-                            writer.add_scalar('data/coseparation_loss', avg_coseparation_loss, i)
-                            # writer.add_scalar('data/crossmodal_loss', avg_crossmodal_loss, i)
+                            writer.add_scalar('data/coseparation_loss', avg_coseparation_loss, total_batches)
 
                         if(opt.measure_time):
                                 print('average data loading time: %.3f' % (sum(data_loading_time)/len(data_loading_time)))
@@ -532,36 +581,27 @@ for epoch in range(1 + opt.epoch_count, opt.niter+1):
 
                 if(total_batches % opt.save_latest_freq == 0):
                         print('saving the latest model (epoch %d, total_batches %d)' % (epoch, total_batches))
-                        torch.save(net_visual.state_dict(), os.path.join('.', opt.checkpoints_dir, opt.name, 'visual_latest.pth'))
-                        torch.save(net_unet.state_dict(), os.path.join('.', opt.checkpoints_dir, opt.name, 'unet_latest.pth'))
-                        torch.save(net_classifier.state_dict(), os.path.join('.', opt.checkpoints_dir, opt.name, 'classifier_latest.pth'))
-                        torch.save(net_vocal.state_dict(), os.path.join('.', opt.checkpoints_dir, opt.name, 'vocal_latest.pth'))
-                        torch.save(net_facial_attribtes.state_dict(), os.path.join('.', opt.checkpoints_dir, opt.name, 'facial_latest.pth'))
+                        save_checkpoint(net_visual, net_unet, optimizer, total_batches, best_err, opt, 'latest')
                         print('Latest learning rate:')
                         print_learning_rate(optimizer)
                 if(total_batches % opt.validation_freq == 0 and opt.validation_on):
                         model.eval()
-                        opt.mode = 'val'
                         print('Display validation results at (epoch %d, total_batches %d)' % (epoch, total_batches))
-                        val_err = display_val(model, crit, writer, total_batches, dataset_val, opt)
+                        val_err = display_val(model, crit, writer, total_batches, dataset_val_loader, opt)
                         print('end of display \n')
                         model.train()
-                        opt.mode = 'main'
                         #save the model that achieves the smallest validation error
                         if val_err < best_err:
                             best_err = val_err
-                            print('saving the best model (epoch %d, total_batches %d) with validation error %.3f\n' % (epoch, total_batches, val_err))
-                            torch.save(net_visual.state_dict(), os.path.join('.', opt.checkpoints_dir, opt.name, 'visual_best.pth'))
-                            torch.save(net_unet.state_dict(), os.path.join('.', opt.checkpoints_dir, opt.name, 'unet_best.pth'))
-                            torch.save(net_classifier.state_dict(), os.path.join('.', opt.checkpoints_dir, opt.name, 'classifier_best.pth'))
-                            torch.save(net_vocal.state_dict(), os.path.join('.', opt.checkpoints_dir, opt.name, 'vocal_best.pth'))
-                            torch.save(net_facial_attribtes.state_dict(), os.path.join('.', opt.checkpoints_dir, opt.name, 'facial_best.pth'))
+                            print('saving the best model (epoch %d, total_batches %d) with validation error %.5f\n' % (epoch, total_batches, val_err))
+                            save_checkpoint(net_visual, net_unet, optimizer, total_batches, best_err, opt, 'best')
                 #decrease learning rate
                 if(total_batches in opt.lr_steps):
                         decrease_learning_rate(optimizer, opt.decay_factor)
                         print('decreased learning rate by ', opt.decay_factor)
 
                 if(opt.measure_time):
-                        torch.cuda.synchronize()
+                        cuda_synchronize()
                         iter_start_time = time.time()
-        opt.mode = 'train'
+
+print('training done: %d batches' % total_batches)

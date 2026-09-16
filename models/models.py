@@ -1,6 +1,5 @@
 import torch
 import torchvision
-import torch.nn as nn
 from .networks import Resnet18, AudioVisual5layerUNet, AudioVisual7layerUNet, weights_init
 
 
