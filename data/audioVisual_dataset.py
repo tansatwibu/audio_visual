@@ -62,19 +62,14 @@ def get_clip_name(npy_path):
     return os.path.basename(npy_path)[0:-4]
 
 def get_frame_root(npy_path):
-    audio_path = npy_path.replace("/home/lanlt/Datle/yolo_","/media/data5/users/dalt/")
-    audio_path = audio_path.replace("/top_detections_new/","/frame_new/")
-    audio_path = audio_path.replace("/top_detections/","/frame/")
-    return os.path.join(os.path.dirname(audio_path))
+    frame_path = npy_path.replace("yolo_top_detections", "frame")
+    return os.path.dirname(frame_path)
     # return os.path.join(os.path.dirname(os.path.dirname(npy_path)), 'frame')
 
 def get_audio_root(npy_path):
-    audio_path = npy_path.replace("yolo_","")
-    audio_path = audio_path.replace("/top_detections_new/","/reshape_11025_new/")
-    # print(npy_path)
-    audio_path = audio_path.replace("/top_detections/","/reshape_11025/")
+    audio_path = npy_path.replace("yolo_top_detections", "reshape_11025")
     # print(audio_path)
-    return os.path.join(os.path.dirname(audio_path))
+    return os.path.dirname(audio_path)
 
 def sample_object_detections(detection_bbs):
     class_index_clusters = {} #get the indexes of the detections for each class
@@ -156,7 +151,7 @@ class AudioVisualMUSICDataset(BaseDataset):
         objects_real_audio_mag = []
         objects_audio_mix_mag = []
         objects_audio_mix_phase = []
-        objects_poses = []
+#        objects_poses = []
         #print("O giua get item")
 
         for n in range(self.NUM_PER_MIX):
@@ -182,13 +177,13 @@ class AudioVisualMUSICDataset(BaseDataset):
                 # print('pose feat size:', pose_feat.size())
                 # objects_poses.append(pose_feat)
 
-                pose_path = "/media/data4/home/lanlt/Datle/LAGCN/feat"
-                pose_clip = os.path.join(pose_path, get_clip_name(clip_det_paths[n]) + ".npy")
-                # print("pose clip: ", pose_clip)
-                pose_feat = np.load(pose_clip)
-                pose_feat = torch.from_numpy(pose_feat)
-                pose_feat = torch.squeeze(pose_feat)
-                objects_poses.append(pose_feat.unsqueeze(0))
+#                pose_path = "/media/data4/home/lanlt/Datle/LAGCN/feat"
+#                pose_clip = os.path.join(pose_path, get_clip_name(clip_det_paths[n]) + ".npy")
+#                # print("pose clip: ", pose_clip)
+#                pose_feat = np.load(pose_clip)
+#                pose_feat = torch.from_numpy(pose_feat)
+#                pose_feat = torch.squeeze(pose_feat)
+#                objects_poses.append(pose_feat.unsqueeze(0))
                 
                 frame_path = os.path.join(get_frame_root(clip_det_paths[n]), get_clip_name(clip_det_paths[n]), str(int(detection_bbs[i,0])).zfill(6) + '.png')
                 label = detection_bbs[i,1] - 1 #make the label start from 0
@@ -250,14 +245,14 @@ class AudioVisualMUSICDataset(BaseDataset):
         vids = np.vstack(objects_vids) #video indexes for each object, each video should have a unique id
         audio_mix_mags = np.vstack(objects_audio_mix_mag)
         audio_mix_phases = np.vstack(objects_audio_mix_phase)
-        poses = np.vstack(objects_poses)
+#        poses = np.vstack(objects_poses)
         # print("pose features size: ", len(objects_pose_feature))
         # print("audio_mags size: ", len(objects_audio_mag))
         #print("O cuoi get item")
 
         data = {'labels': labels, 'audio_mags': audio_mags, 'audio_mix_mags': audio_mix_mags, 'vids': vids}
         data['visuals'] = visuals
-        data['poses'] = poses
+#        data['poses'] = poses
 
         if self.opt.mode == 'val' or self.opt.mode == 'test':
             data['audio_phases'] = audio_phases

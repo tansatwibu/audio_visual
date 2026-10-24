@@ -25,7 +25,7 @@ def generate_spectrogram_magphase(audio, stft_frame, stft_hop, with_phase=True):
 
 def augment_audio(audio):
     # Scale audio randomly between 0.5 and 1.5
-    audio = audio * (random.random() + 0.5) 
+    audio = audio * (random.random() + 0.5)
     audio[audio > 1.] = 1.
     audio[audio < -1.] = -1.
     return audio
@@ -63,7 +63,7 @@ def get_vid_name(npy_path):
     if "_clip_" in clip_name:
         return clip_name.split("_clip_")[0]
     # Fallback to old code logic if dataset format changes
-    return clip_name[0:11] 
+    return clip_name[0:11]
 
 def get_audio_path(npy_path):
     # Replace yolo_top_detections folder with reshape_11025
@@ -86,7 +86,7 @@ def sample_object_detections(detection_bbs):
             class_index_clusters[int(detection_bbs[i,1])].append(i)
         else:
             class_index_clusters[int(detection_bbs[i,1])] = [i]
-            
+
     detection2return = np.array([])
     for cls in class_index_clusters.keys():
         sampledIndex = random.choice(class_index_clusters[cls])
@@ -111,10 +111,10 @@ class AudioVisualMUSICDataset(BaseDataset):
         # 1. Read txt file containing .npy paths
         self.detection_dic = {}
         h5f_path = os.path.join(opt.hdf5_path, opt.mode + '.txt')
-        
+
         with open(h5f_path) as f:
             detections = [line.strip() for line in f.readlines()]
-            
+
         # Gather clips for each video
         for npy_detect in detections:
             vidname = get_vid_name(npy_detect)
@@ -130,7 +130,7 @@ class AudioVisualMUSICDataset(BaseDataset):
             vision_transform_list = [transforms.Resize(256), transforms.RandomCrop(224), transforms.ToTensor()]
         else:
             vision_transform_list = [transforms.Resize((256, 256)), transforms.RandomCrop(224), transforms.ToTensor()]
-        
+
         if opt.subtract_mean:
             vision_transform_list.append(transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]))
         self.vision_transform = transforms.Compose(vision_transform_list)
@@ -144,13 +144,13 @@ class AudioVisualMUSICDataset(BaseDataset):
     def __getitem__(self, index):
         # Get random videos to mix
         videos2Mix = random.sample(list(self.detection_dic.keys()), self.NUM_PER_MIX)
-        
+
         clip_det_paths = [None for _ in range(self.NUM_PER_MIX)]
         clip_det_bbs = [None for _ in range(self.NUM_PER_MIX)]
-        
+
         for n in range(self.NUM_PER_MIX):
             # Randomly sample a clip from the video
-            clip_det_paths[n] = random.choice(self.detection_dic[videos2Mix[n]]) 
+            clip_det_paths[n] = random.choice(self.detection_dic[videos2Mix[n]])
             # Load the bbs for the clip and sample one from each class
             clip_det_bbs[n] = sample_object_detections(np.load(clip_det_paths[n]))
 
@@ -166,17 +166,17 @@ class AudioVisualMUSICDataset(BaseDataset):
         for n in range(self.NUM_PER_MIX):
             # Generate a unique video id
             vid = random.randint(1, 100000000000)
-            
+
             # --- AUDIO PROCESSING ---
             audio_path = get_audio_path(clip_det_paths[n])
             audio, audio_rate = librosa.load(audio_path, sr=self.opt.audio_sampling_rate)
             audio_segment = sample_audio(audio, self.audio_window)
-            
+
             if self.opt.enable_data_augmentation and self.opt.mode == 'train':
                 audio_segment = augment_audio(audio_segment)
-                
-            audio_mag, audio_phase = generate_spectrogram_magphase(audio_segment, self.stft_frame, self.stft_hop)            
-            
+
+            audio_mag, audio_phase = generate_spectrogram_magphase(audio_segment, self.stft_frame, self.stft_hop)
+
             # Make a copy of the audio to mix later
             audios[n] = audio_segment
             detection_bbs = clip_det_bbs[n]
@@ -185,35 +185,35 @@ class AudioVisualMUSICDataset(BaseDataset):
             for i in range(detection_bbs.shape[0]):
                 frame_id = detection_bbs[i,0]
                 frame_path = get_frame_path(clip_det_paths[n], frame_id)
-                
+
                 # Make the label start from 0
                 label = detection_bbs[i,1] - 1
                 object_image = Image.open(frame_path).convert('RGB').crop((
-                    detection_bbs[i,-4], detection_bbs[i,-3], 
+                    detection_bbs[i,-4], detection_bbs[i,-3],
                     detection_bbs[i,-2], detection_bbs[i,-1]
                 ))
-                
+
                 if self.opt.enable_data_augmentation and self.opt.mode == 'train':
                     object_image = augment_image(object_image)
-                    
+
                 objects_visuals.append(self.vision_transform(object_image).unsqueeze(0))
                 objects_labels.append(label)
-                
+
                 # Make a copy of the audio spec for each object
                 objects_audio_mag.append(torch.FloatTensor(audio_mag).unsqueeze(0))
                 objects_audio_phase.append(torch.FloatTensor(audio_phase).unsqueeze(0))
                 objects_vids.append(vid)
-            
+
             # --- SCENE IMAGE PROCESSING ---
             if self.opt.with_additional_scene_image:
                 scene_image_path = random.choice(self.scene_images)
                 scene_image = Image.open(scene_image_path).convert('RGB')
-                
+
                 if self.opt.enable_data_augmentation and self.opt.mode == 'train':
                     scene_image = augment_image(scene_image)
-                    
+
                 objects_visuals.append(self.vision_transform(scene_image).unsqueeze(0))
-                
+
                 # Use padded label for scene image
                 objects_labels.append(self.opt.number_of_classes - 1)
                 objects_audio_mag.append(torch.FloatTensor(audio_mag).unsqueeze(0))
@@ -223,24 +223,30 @@ class AudioVisualMUSICDataset(BaseDataset):
         # --- MIX AUDIO ---
         audio_mix = np.asarray(audios).sum(axis=0) / self.NUM_PER_MIX
         audio_mix_mag, audio_mix_phase = generate_spectrogram_magphase(audio_mix, self.stft_frame, self.stft_hop)
-        
+
         # Make a copy of mixed audio spec for each object
         for n in range(self.NUM_PER_MIX):
             detection_bbs = clip_det_bbs[n]
             for i in range(detection_bbs.shape[0]):
                 objects_audio_mix_mag.append(torch.FloatTensor(audio_mix_mag).unsqueeze(0))
                 objects_audio_mix_phase.append(torch.FloatTensor(audio_mix_phase).unsqueeze(0))
-            
+
             if self.opt.with_additional_scene_image:
                 objects_audio_mix_mag.append(torch.FloatTensor(audio_mix_mag).unsqueeze(0))
                 objects_audio_mix_phase.append(torch.FloatTensor(audio_mix_phase).unsqueeze(0))
+
+				# ---EMPTY BBOX FIX ---
+        if len(objects_visuals) == 0:
+            print(f"Warning: Empty detection found! Resampling data...")
+            random_idx = random.randint(0, len(self) - 1)
+            return self.__getitem__(random_idx)
 
         # --- PACK DATA ---
         data = {
             'visuals': np.vstack(objects_visuals),          # Detected objects
             'labels': np.vstack(objects_labels),            # Labels for each object
             'audio_mags': np.vstack(objects_audio_mag),     # Audio spectrogram magnitude
-            'audio_mix_mags': np.vstack(objects_audio_mix_mag), 
+            'audio_mix_mags': np.vstack(objects_audio_mix_mag),
             'vids': np.vstack(objects_vids)                 # Unique video indexes
         }
 
@@ -248,7 +254,7 @@ class AudioVisualMUSICDataset(BaseDataset):
         if self.opt.mode in ['val', 'test']:
             data['audio_phases'] = np.vstack(objects_audio_phase)
             data['audio_mix_phases'] = np.vstack(objects_audio_mix_phase)
-            
+
         return data
 
     def __len__(self):

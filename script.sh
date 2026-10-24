@@ -1,10 +1,10 @@
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 \
 python train.py \
   --name run_av_2branch \
-  --model audioVisual \
+  --model audioVisualMUSIC \
   --data_path /media/data4/home/lanlt/ducanh/dataset_av \
-  --auto_split --val_ratio 0.1 \
-  --batchSize 1 --nThreads 4 \
+	--hdf5_path /media/data4/home/lanlt/ducanh/dataset_av/hdf5_split	\
+  --batchSize 2 --nThreads 4 \
   --num_batch 100000 \
   --lr_steps 60000 90000 \
   --unet_num_layers 7 \
