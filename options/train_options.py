@@ -36,7 +36,7 @@ class TrainOptions(BaseOptions):
 		self.parser.add_argument('--unet_ngf', type=int, default=64, help="unet base channel dimension")
 		self.parser.add_argument('--unet_input_nc', type=int, default=1, help="input spectrogram number of channels")
 		self.parser.add_argument('--unet_output_nc', type=int, default=1, help="output spectrogram number of channels")
-		self.parser.add_argument('--number_of_classes', default=15, type=int, help='number of classes')
+		self.parser.add_argument('--number_of_classes', default=11, type=int, help='number of classes')
 		self.parser.add_argument('--classifier_loss_weight', default=1, type=float, help='weight for classifier loss')
 		self.parser.add_argument('--coseparation_loss_weight', default=20, type=float, help='weight for reconstruction loss')
 		self.parser.add_argument('--crossmodal_loss_weight', default=1, type=float, help='weight for crossmodal loss')

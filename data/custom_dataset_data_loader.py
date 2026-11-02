@@ -26,7 +26,7 @@ class CustomDatasetDataLoader(BaseDataLoader):
             self.dataloader = torch.utils.data.DataLoader(
                 self.dataset,
                 batch_size=opt.batchSize,
-                shuffle=False,
+                shuffle=True,
                 num_workers=int(opt.nThreads),
                 collate_fn=object_collate,
                 # pin_memory=True,
@@ -38,7 +38,7 @@ class CustomDatasetDataLoader(BaseDataLoader):
                 self.dataset,
                 batch_size=opt.batchSize,
                 shuffle=False,
-                num_workers=2,
+                num_workers=0,
                 collate_fn=object_collate)          
 
     def load_data(self):

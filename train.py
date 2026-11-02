@@ -546,7 +546,7 @@ for epoch in range(1 + opt.epoch_count, opt.niter+1):
                         val_err = display_val(model, crit, writer, total_batches, dataset_val, opt)
                         print('end of display \n')
                         model.train()
-                        opt.mode = 'main'
+                        opt.mode = 'train'
                         #save the model that achieves the smallest validation error
                         if val_err < best_err:
                             best_err = val_err

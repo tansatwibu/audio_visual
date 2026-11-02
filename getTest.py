@@ -2,9 +2,9 @@ import os
 import subprocess
 
 
-#base_dir = "results2/"  #
+base_dir = "results2/"  #
 #base_dir = "results3/"  #
-base_dir	= "results/"
+#base_dir	= "results/"
 
 selected_dirs = [d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d))]
 

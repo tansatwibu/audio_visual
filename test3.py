@@ -3,6 +3,8 @@
 
 import os
 import argparse
+import random
+from collections import defaultdict
 import librosa
 import numpy as np
 from PIL import Image
@@ -22,12 +24,27 @@ def clip_audio(audio):
     audio[audio < -1.] = -1.
     return audio
 
+def get_instrument_name(path):
+    basename = os.path.basename(path).replace(".npy", "")
+    if "_video_" in basename:
+        return basename.split("_video_")[0].lower()
+    known_classes = [
+        'dan_da', 'dan_nguyet', 'dan_tranh', 'tam_thap_luc', 
+        'dan_bau', 'dan_day', 'dan_nhi', 'dantrung', 
+        'kenbau', 'sao_truc', 'tyba'
+    ]
+    basename_lower = basename.lower()
+    for cls in known_classes:
+        if cls in basename_lower:
+            return cls
+    return basename_lower[:11]
+
 def get_separated_audio(outputs, batch_data, opt):
     mag_mix = batch_data['audio_mix_mags']
     phase_mix = batch_data['audio_mix_phases']
     pred_masks_ = outputs['pred_mask']
-    
     B = mag_mix.size(0)
+    
     if opt.log_freq:
         grid_unwarp = torch.from_numpy(utils.warpgrid(B, opt.stft_frame//2+1, pred_masks_.size(3), warp=False)).to(opt.device)
         pred_masks_linear = F.grid_sample(pred_masks_, grid_unwarp)
@@ -40,7 +57,6 @@ def get_separated_audio(outputs, batch_data, opt):
     pred_mag = mag_mix[0, 0] * pred_masks_linear[0, 0]
     preds_wav = utils.istft_reconstruction(pred_mag, phase_mix[0, 0], hop_length=opt.stft_hop, length=opt.audio_window)
     return preds_wav
-
 
 def get_detection_at_time(sliding_window_start, audio_sampling_rate, detectionResult, frame_PATH, vision_transform):
     current_time_sec = sliding_window_start / audio_sampling_rate
@@ -58,7 +74,6 @@ def get_detection_at_time(sliding_window_start, audio_sampling_rate, detectionRe
     img = Image.open(frame_path).convert('RGB').crop((det_box[-4], det_box[-3], det_box[-2], det_box[-1]))
     return vision_transform(img).unsqueeze(0)
 
-
 def main():
     opt = TestOptions().parse()
     opt.device = torch.device("cuda")
@@ -71,8 +86,7 @@ def main():
         unet_num_layers=opt.unet_num_layers, ngf=opt.unet_ngf,
         input_nc=opt.unet_input_nc, output_nc=opt.unet_output_nc, weights=opt.weights_unet)
     
-    if opt.with_additional_scene_image: 
-        opt.number_of_classes += 1
+    if opt.with_additional_scene_image: opt.number_of_classes += 1
     
     net_classifier = builder.build_classifier(
         pool_type=opt.classifier_pool, num_of_classes=opt.number_of_classes,
@@ -89,31 +103,39 @@ def main():
     with open(test_file, 'r') as f:
         all_videos = [line.strip() for line in f.readlines() if line.strip()]
 
-    import random
     random.seed(42) 
-    
-    # ---------------------------------------------------------
-    # ---------------------------------------------------------
-    NUM_PAIRS_WANTED = 200 
-    
-    test_pairs_set = set()
-    
-    while len(test_pairs_set) < NUM_PAIRS_WANTED:
-        v1, v2 = random.sample(all_videos, 2)
-        pair = tuple(sorted([v1, v2]))
-        test_pairs_set.add(pair)
-    
-    test_pairs = list(test_pairs_set)
-    # ---------------------------------------------------------
+
+    # Gom nhom theo lop nhac cu
+    class_to_videos = defaultdict(list)
+    for vid in all_videos:
+        cls = get_instrument_name(vid)
+        class_to_videos[cls].append(vid)
+
+    for cls in class_to_videos:
+        random.shuffle(class_to_videos[cls])
+
+    test_pairs = []
+    classes = list(class_to_videos.keys())
+
+    # Ghep 2 nhac cu khac nhau
+    while True:
+        active_classes = [c for c in classes if len(class_to_videos[c]) > 0]
+        if len(active_classes) < 2:
+            break
+        c1, c2 = random.sample(active_classes, 2)
+        v1 = class_to_videos[c1].pop()
+        v2 = class_to_videos[c2].pop()
+        test_pairs.append((v1, v2))
+
+    print(f"Tong so cap test hop le (100% khac loai nhac cu): {len(test_pairs)}")
 
     for i, (video_name1, video_name2) in enumerate(test_pairs):
-        print(f"\n[{i+1}/{len(test_pairs)}] Dang xu ly: {video_name1} VS {video_name2}")
+        print(f"[{i+1}/{len(test_pairs)}] Dang xu ly: {video_name1} VS {video_name2}")
         opt.video1_name = video_name1.replace(".npy", "")
         opt.video2_name = video_name2.replace(".npy", "")
         
         audio1_path = opt.video1_name.replace("yolo_top_detections", "reshape_11025") + ".wav"
         audio2_path = opt.video2_name.replace("yolo_top_detections", "reshape_11025") + ".wav"
-        
         audio1, _ = librosa.load(audio1_path, sr=opt.audio_sampling_rate)
         audio2, _ = librosa.load(audio2_path, sr=opt.audio_sampling_rate)
             
@@ -178,8 +200,7 @@ def main():
         name1 = os.path.basename(opt.video1_name)
         name2 = os.path.basename(opt.video2_name)
         output_dir = os.path.join(opt.output_dir_root, f"{name1}_VS_{name2}")
-        if not os.path.isdir(output_dir): 
-            os.makedirs(output_dir)
+        if not os.path.isdir(output_dir): os.makedirs(output_dir)
         
         sf.write(os.path.join(output_dir, 'audio1.wav'), audio1, opt.audio_sampling_rate)
         sf.write(os.path.join(output_dir, 'audio2.wav'), audio2, opt.audio_sampling_rate)

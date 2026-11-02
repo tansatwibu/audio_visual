@@ -1,6 +1,7 @@
 import os
 import random
 import glob
+import math
 import h5py
 import librosa
 import numpy as np
@@ -49,7 +50,7 @@ def augment_image(image):
     return image
 
 # ==========================================
-# PATH HELPER FUNCTIONS
+# PATH & CLASS HELPER FUNCTIONS
 # ==========================================
 def get_clip_name(npy_path):
     # Get original file name without extension
@@ -64,6 +65,31 @@ def get_vid_name(npy_path):
         return clip_name.split("_clip_")[0]
     # Fallback to old code logic if dataset format changes
     return clip_name[0:11] 
+
+def get_class_name(npy_path):
+    # Trich xuat class name tu ten file hoac duong dan
+    basename = os.path.basename(npy_path).replace(".npy", "")
+    if "_video_" in basename:
+        return basename.split("_video_")[0].lower()
+    
+    # Kiem tra danh sach cac nhac cu truyen thong
+    known_classes = [
+        'dan_da', 'dan_nguyet', 'dan_tranh', 'tam_thap_luc', 
+        'dan_bau', 'dan_day', 'dan_nhi', 'dantrung', 
+        'kenbau', 'sao_truc', 'tyba'
+    ]
+    path_lower = npy_path.lower()
+    for cls in known_classes:
+        if cls in path_lower:
+            return cls
+            
+    # Thu lay tu thu muc cha neu folder la ten class
+    parent_dir = os.path.basename(os.path.dirname(npy_path)).lower()
+    if parent_dir not in ['top_detections_two_classes', 'music_solo', 'yolo_top_detections', 'reshape_11025', 'frame', '']:
+        return parent_dir
+
+    # Fallback ve video id neu khong xac dinh duoc
+    return get_vid_name(npy_path)
 
 def get_audio_path(npy_path):
     # Replace yolo_top_detections folder with reshape_11025
@@ -109,19 +135,39 @@ class AudioVisualMUSICDataset(BaseDataset):
         random.seed(opt.seed)
 
         # 1. Read txt file containing .npy paths
-        self.detection_dic = {}
+        self.detection_dic = {}       # vidname -> list of clip paths
+        self.class_to_videos = {}     # class_name -> list of unique vidnames
         h5f_path = os.path.join(opt.hdf5_path, opt.mode + '.txt')
         
         with open(h5f_path) as f:
-            detections = [line.strip() for line in f.readlines()]
+            detections = [line.strip() for line in f.readlines() if line.strip()]
             
-        # Gather clips for each video
+        # Gather clips for each video and group videos by class
         for npy_detect in detections:
             vidname = get_vid_name(npy_detect)
+            clsname = get_class_name(npy_detect)
+
             if vidname in self.detection_dic:
                 self.detection_dic[vidname].append(npy_detect)
             else:
                 self.detection_dic[vidname] = [npy_detect]
+
+            if clsname not in self.class_to_videos:
+                self.class_to_videos[clsname] = []
+            if vidname not in self.class_to_videos[clsname]:
+                self.class_to_videos[clsname].append(vidname)
+
+        self.classes = sorted(list(self.class_to_videos.keys()))
+        
+        # --- TINH TOAN TRONG SO CAN BANG MEM (SMOOTH SAMPLING WEIGHTS: sqrt(N_c)) ---
+        raw_weights = [math.sqrt(len(self.class_to_videos[cls])) for cls in self.classes]
+        total_weight = sum(raw_weights) if sum(raw_weights) > 0 else 1.0
+        self.class_weights = [w / total_weight for w in raw_weights]
+
+        print(f"[{opt.mode.upper()}] Da load {len(detections)} clips tu {len(self.detection_dic)} videos qua {len(self.classes)} lop nhac cu:")
+        for cls, w in zip(self.classes, self.class_weights):
+            num_vids = len(self.class_to_videos[cls])
+            print(f"  - Lop '{cls}': {num_vids:2d} videos | Xac suat can bang mem (sqrt): {w*100:.2f}%")
 
         # 2. Initialize Transforms
         if opt.mode == 'val':
@@ -142,8 +188,31 @@ class AudioVisualMUSICDataset(BaseDataset):
             self.scene_images = h5f['image'][:]
 
     def __getitem__(self, index):
-        # Get random videos to mix
-        videos2Mix = random.sample(list(self.detection_dic.keys()), self.NUM_PER_MIX)
+        # --- CAN BANG MEM (SMOOTH / TEMPERATURE SAMPLING) CHO TRAINING ---
+        # Su dung xac suat ti le thuan voi sqrt(N_c) de:
+        # 1. Tang tan suat xuat hien cua lop hiem (3-4 video) ma khong lam overfit.
+        # 2. Van bao toan thoi luong hoc day du cho cac lop da so (21 video) de giu vung diem SDR.
+        if self.opt.mode == 'train' and len(self.classes) >= self.NUM_PER_MIX:
+            selected_classes = []
+            available_classes = list(self.classes)
+            available_weights = list(self.class_weights)
+
+            for _ in range(self.NUM_PER_MIX):
+                chosen_cls = random.choices(available_classes, weights=available_weights, k=1)[0]
+                selected_classes.append(chosen_cls)
+                # Loai lop da chon de dam bao mix giua 2 nhac cu khac nhau
+                chosen_idx = available_classes.index(chosen_cls)
+                available_classes.pop(chosen_idx)
+                available_weights.pop(chosen_idx)
+
+            videos2Mix = [random.choice(self.class_to_videos[c]) for c in selected_classes]
+        else:
+            # Fallback neu so lop nho hon NUM_PER_MIX hoac khi val/test
+            all_vids = list(self.detection_dic.keys())
+            if len(all_vids) >= self.NUM_PER_MIX:
+                videos2Mix = random.sample(all_vids, self.NUM_PER_MIX)
+            else:
+                videos2Mix = random.choices(all_vids, k=self.NUM_PER_MIX)
         
         clip_det_paths = [None for _ in range(self.NUM_PER_MIX)]
         clip_det_bbs = [None for _ in range(self.NUM_PER_MIX)]
@@ -234,8 +303,8 @@ class AudioVisualMUSICDataset(BaseDataset):
             if self.opt.with_additional_scene_image:
                 objects_audio_mix_mag.append(torch.FloatTensor(audio_mix_mag).unsqueeze(0))
                 objects_audio_mix_phase.append(torch.FloatTensor(audio_mix_phase).unsqueeze(0))
-								
-				# ---EMPTY BBOX FIX ---				
+        
+        # --- EMPTY BBOX FIX ---
         if len(objects_visuals) == 0:
             print(f"Warning: Empty detection found! Resampling data...")
             random_idx = random.randint(0, len(self) - 1)
